@@ -31,6 +31,13 @@ def split_audio_ffmpeg(audio_file: str, max_size: int = 20*1024*1024) -> List[st
     if file_size <= max_size:
         return [audio_file]
     
+    # Check if ffmpeg is available
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("ffmpeg not available, returning original file")
+        return [audio_file]
+    
     # Get duration in seconds
     result = subprocess.run(
         ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of',
@@ -103,65 +110,94 @@ def transcribe_with_retry(audio_file_path: str, max_retries: int = 3) -> str:
 @app.post("/transcribe")
 def transcribe_video(req: VideoRequest):
     url = req.url
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # Try to get subtitles first
-        cmd = [
-            "yt-dlp",
-            "--write-sub",
-            "--write-auto-sub",
-            "--sub-langs", "en,en-US,en-GB",
-            "--sub-format", "vtt",
-            "--skip-download",
-            "--no-warnings",
-            "-o", f"{temp_dir}/%(title)s.%(ext)s",
-            url
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        vtt_files = glob.glob(f"{temp_dir}/*.vtt")
-        if vtt_files:
-            with open(vtt_files[0], "r", encoding="utf-8") as f:
-                content = f.read()
-            return {"method": "subtitles", "transcript": content}
+    print(f"Starting transcription for URL: {url}")
+    
+    # Check if yt-dlp is available
+    try:
+        subprocess.run(['yt-dlp', '--version'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("yt-dlp not available")
+        raise HTTPException(status_code=500, detail="yt-dlp not available on this system")
+    
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Try to get subtitles first
+            cmd = [
+                "yt-dlp",
+                "--write-sub",
+                "--write-auto-sub",
+                "--sub-langs", "en,en-US,en-GB",
+                "--sub-format", "vtt",
+                "--skip-download",
+                "--no-warnings",
+                "-o", f"{temp_dir}/%(title)s.%(ext)s",
+                url
+            ]
+            print(f"Running subtitle command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            print(f"Subtitle command result: {result.returncode}")
+            print(f"Subtitle command stdout: {result.stdout}")
+            print(f"Subtitle command stderr: {result.stderr}")
+            
+            vtt_files = glob.glob(f"{temp_dir}/*.vtt")
+            print(f"Found VTT files: {vtt_files}")
+            
+            if vtt_files:
+                with open(vtt_files[0], "r", encoding="utf-8") as f:
+                    content = f.read()
+                return {"method": "subtitles", "transcript": content}
 
-        # Fallback: download audio and transcribe with OpenAI Whisper
-        cmd = [
-            "yt-dlp",
-            "--extract-audio",
-            "--audio-format", "mp3",
-            "--audio-quality", "192K",
-            "--no-warnings",
-            "-o", f"{temp_dir}/%(title)s.%(ext)s",
-            url
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        audio_files = glob.glob(f"{temp_dir}/*.mp3")
-        if audio_files:
-            audio_file_path = audio_files[0]
-            print(f"Processing audio file: {audio_file_path}")
+            # Fallback: download audio and transcribe with OpenAI Whisper
+            cmd = [
+                "yt-dlp",
+                "--extract-audio",
+                "--audio-format", "mp3",
+                "--audio-quality", "192K",
+                "--no-warnings",
+                "-o", f"{temp_dir}/%(title)s.%(ext)s",
+                url
+            ]
+            print(f"Running audio command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            print(f"Audio command result: {result.returncode}")
+            print(f"Audio command stdout: {result.stdout}")
+            print(f"Audio command stderr: {result.stderr}")
             
-            # Split audio if needed (20MB chunks for safety)
-            max_size = 20 * 1024 * 1024
-            chunk_paths = split_audio_ffmpeg(audio_file_path, max_size)
-            print(f"Split into {len(chunk_paths)} chunks")
+            audio_files = glob.glob(f"{temp_dir}/*.mp3")
+            print(f"Found audio files: {audio_files}")
             
-            full_transcript = ""
-            for i, chunk_path in enumerate(chunk_paths):
-                print(f"Transcribing chunk {i+1}/{len(chunk_paths)}: {chunk_path}")
-                try:
-                    transcript = transcribe_with_retry(chunk_path)
-                    full_transcript += transcript + "\n"
-                except Exception as e:
-                    print(f"Failed to transcribe chunk {i+1}: {str(e)}")
-                    # Continue with other chunks
+            if audio_files:
+                audio_file_path = audio_files[0]
+                print(f"Processing audio file: {audio_file_path}")
                 
-                # Clean up chunk file if it's not the original
-                if chunk_path != audio_file_path and os.path.exists(chunk_path):
-                    os.remove(chunk_path)
-            
-            if full_transcript.strip():
-                return {"method": "audio", "transcript": full_transcript.strip()}
-            else:
-                raise HTTPException(status_code=500, detail="Failed to transcribe any audio chunks")
+                # Split audio if needed (20MB chunks for safety)
+                max_size = 20 * 1024 * 1024
+                chunk_paths = split_audio_ffmpeg(audio_file_path, max_size)
+                print(f"Split into {len(chunk_paths)} chunks")
+                
+                full_transcript = ""
+                for i, chunk_path in enumerate(chunk_paths):
+                    print(f"Transcribing chunk {i+1}/{len(chunk_paths)}: {chunk_path}")
+                    try:
+                        transcript = transcribe_with_retry(chunk_path)
+                        full_transcript += transcript + "\n"
+                    except Exception as e:
+                        print(f"Failed to transcribe chunk {i+1}: {str(e)}")
+                        # Continue with other chunks
+                    
+                    # Clean up chunk file if it's not the original
+                    if chunk_path != audio_file_path and os.path.exists(chunk_path):
+                        os.remove(chunk_path)
+                
+                if full_transcript.strip():
+                    return {"method": "audio", "transcript": full_transcript.strip()}
+                else:
+                    raise HTTPException(status_code=500, detail="Failed to transcribe any audio chunks")
 
-        raise HTTPException(status_code=500, detail="Failed to get transcript from video.")
+            raise HTTPException(status_code=500, detail="Failed to get transcript from video.")
+    except Exception as e:
+        print(f"Error in transcribe_video: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
