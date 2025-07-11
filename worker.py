@@ -12,8 +12,14 @@ from typing import List
 
 app = FastAPI()
 
-# Replace with your OpenAI API key
-OPENAI_API_KEY = "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"
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "VibeKnowing Worker"}
+
+# Get OpenAI API key from environment variable
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable is required")
 client = OpenAI(api_key=OPENAI_API_KEY, timeout=300.0)  # 5 minute timeout
 
 class VideoRequest(BaseModel):
