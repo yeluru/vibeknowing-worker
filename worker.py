@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 import subprocess
 import tempfile
@@ -16,10 +16,13 @@ app = FastAPI()
 def health_check():
     return {"status": "healthy", "service": "VibeKnowing Worker"}
 
-# Get OpenAI API key from environment variable
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Get OpenAI API key from environment variable or hardcoded value
+# PASTE YOUR API KEY HERE IF RUNNING LOCALLY WITHOUT ENV VARS
+OPENAI_API_KEY_HARDCODED = ""
+
+OPENAI_API_KEY = OPENAI_API_KEY_HARDCODED or os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY environment variable is required")
+    raise ValueError("OPENAI_API_KEY is required. Please set OPENAI_API_KEY_HARDCODED in worker.py or use environment variable.")
 client = OpenAI(api_key=OPENAI_API_KEY, timeout=300.0)  # 5 minute timeout
 
 class VideoRequest(BaseModel):
@@ -145,7 +148,56 @@ def transcribe_video(req: VideoRequest):
             if vtt_files:
                 with open(vtt_files[0], "r", encoding="utf-8") as f:
                     content = f.read()
-                return {"method": "subtitles", "transcript": content}
+                
+                # Clean VTT content - extract only the actual text
+                import re
+                lines = content.splitlines()
+                cleaned_lines = []
+                seen_lines = set()
+                
+                for line in lines:
+                    line = line.strip()
+                    # Skip timestamps, headers, and empty lines
+                    if (not line or 
+                        line.startswith('WEBVTT') or 
+                        '-->' in line or 
+                        line.isdigit() or
+                        line.startswith('Kind:') or
+                        line.startswith('Language:') or
+                        line.startswith('align:') or
+                        line in seen_lines):
+                        continue
+                    
+                    # Remove timestamp tags like <00:00:00.240><c> text </c>
+                    # This regex removes all <...> tags
+                    cleaned_line = re.sub(r'<[^>]+>', '', line)
+                    cleaned_line = cleaned_line.strip()
+                    
+                    if cleaned_line and cleaned_line not in seen_lines:
+                        cleaned_lines.append(cleaned_line)
+                        seen_lines.add(cleaned_line)
+                
+                cleaned_content = " ".join(cleaned_lines)
+                
+                # Extract title using yt-dlp metadata (more reliable than filename)
+                title = "Video"
+                try:
+                    title_cmd = ["yt-dlp", "--get-title", "--no-warnings", url]
+                    title_result = subprocess.run(title_cmd, capture_output=True, text=True, timeout=10, cwd=temp_dir)
+                    if title_result.returncode == 0 and title_result.stdout.strip():
+                        title = title_result.stdout.strip()
+                    else:
+                        # Fallback: extract from VTT filename
+                        vtt_filename = os.path.basename(vtt_files[0])
+                        title = vtt_filename.replace('.en.vtt', '').replace('.vtt', '')
+                except Exception as e:
+                    print(f"Failed to extract title: {e}")
+                    # Fallback: extract from VTT filename
+                    vtt_filename = os.path.basename(vtt_files[0])
+                    title = vtt_filename.replace('.en.vtt', '').replace('.vtt', '')
+                
+                print(f"Extracted title for {url}: {title}")
+                return {"method": "subtitles", "transcript": cleaned_content, "title": title}
 
             # Fallback: download audio and transcribe with OpenAI Whisper
             cmd = [
@@ -189,8 +241,26 @@ def transcribe_video(req: VideoRequest):
                     if chunk_path != audio_file_path and os.path.exists(chunk_path):
                         os.remove(chunk_path)
                 
+                
+                # Extract title using yt-dlp metadata
+                title = "Video"
+                try:
+                    title_cmd = ["yt-dlp", "--get-title", "--no-warnings", url]
+                    title_result = subprocess.run(title_cmd, capture_output=True, text=True, timeout=10, cwd=temp_dir)
+                    if title_result.returncode == 0 and title_result.stdout.strip():
+                        title = title_result.stdout.strip()
+                    elif audio_files:
+                        # Fallback: extract from filename (remove extension)
+                        filename = os.path.basename(audio_files[0])
+                        title = os.path.splitext(filename)[0]
+                except Exception as e:
+                    print(f"Failed to extract title: {e}")
+                    if audio_files:
+                        filename = os.path.basename(audio_files[0])
+                        title = os.path.splitext(filename)[0]
+
                 if full_transcript.strip():
-                    return {"method": "audio", "transcript": full_transcript.strip()}
+                    return {"method": "audio", "transcript": full_transcript.strip(), "title": title}
                 else:
                     raise HTTPException(status_code=500, detail="Failed to transcribe any audio chunks")
 
@@ -201,3 +271,83 @@ def transcribe_video(req: VideoRequest):
         print(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+@app.post("/transcribe-file")
+async def transcribe_file(file: UploadFile = File(...)):
+    """Transcribe uploaded video or audio file"""
+    print(f"Received file upload: {file.filename}, content_type: {file.content_type}")
+    
+    # Validate file type
+    allowed_types = [
+        'video/mp4', 'video/webm', 'video/quicktime', 'video/x-msvideo',
+        'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/x-wav', 'audio/mp4', 'audio/m4a',
+        'audio/x-m4a', 'audio/ogg', 'audio/webm'
+    ]
+    
+    if file.content_type not in allowed_types:
+        print(f"Unsupported file type: {file.content_type}")
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.content_type}")
+    
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Save uploaded file
+            file_ext = os.path.splitext(file.filename)[1] or '.mp4'
+            temp_file_path = f"{temp_dir}/uploaded{file_ext}"
+            
+            with open(temp_file_path, "wb") as f:
+                content = await file.read()
+                f.write(content)
+            
+            print(f"Saved file to: {temp_file_path}, size: {os.path.getsize(temp_file_path)} bytes")
+            
+            # Extract audio from video if needed
+            audio_file_path = f"{temp_dir}/audio.mp3"
+            cmd = [
+                'ffmpeg', '-y', '-i', temp_file_path,
+                '-vn',  # No video
+                '-acodec', 'libmp3lame',
+                '-ar', '16000',
+                '-ac', '1',
+                '-b:a', '128k',
+                audio_file_path
+            ]
+            
+            print(f"Extracting audio: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode != 0 or not os.path.exists(audio_file_path):
+                print(f"Audio extraction failed: {result.stderr}")
+                raise HTTPException(status_code=500, detail="Failed to extract audio from file")
+            
+            print(f"Audio extracted: {audio_file_path}, size: {os.path.getsize(audio_file_path)} bytes")
+            
+            # Split audio if needed (20MB chunks for safety)
+            max_size = 20 * 1024 * 1024
+            chunk_paths = split_audio_ffmpeg(audio_file_path, max_size)
+            print(f"Split into {len(chunk_paths)} chunks")
+            
+            full_transcript = ""
+            for i, chunk_path in enumerate(chunk_paths):
+                print(f"Transcribing chunk {i+1}/{len(chunk_paths)}: {chunk_path}")
+                try:
+                    transcript = transcribe_with_retry(chunk_path)
+                    full_transcript += transcript + "\n"
+                except Exception as e:
+                    print(f"Failed to transcribe chunk {i+1}: {str(e)}")
+                    # Continue with other chunks
+                
+                # Clean up chunk file if it's not the original
+                if chunk_path != audio_file_path and os.path.exists(chunk_path):
+                    os.remove(chunk_path)
+            
+            if full_transcript.strip():
+                # Extract title from filename (remove extension)
+                title = os.path.splitext(file.filename)[0]
+                return {"method": "file_upload", "transcript": full_transcript.strip(), "title": title}
+            else:
+                raise HTTPException(status_code=500, detail="Failed to transcribe any audio chunks")
+                
+    except Exception as e:
+        print(f"Error in transcribe_file: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
