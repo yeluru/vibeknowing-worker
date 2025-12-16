@@ -25,8 +25,88 @@ if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY is required. Please set OPENAI_API_KEY_HARDCODED in worker.py or use environment variable.")
 client = OpenAI(api_key=OPENAI_API_KEY, timeout=300.0)  # 5 minute timeout
 
+import base64
+
 class VideoRequest(BaseModel):
     url: str
+
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+def extract_frames(video_path, output_dir, interval=2.0):
+    """Extract frames from video every `interval` seconds"""
+    # Check if ffmpeg is available
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("ffmpeg not available for frame extraction")
+        return []
+
+    output_pattern = os.path.join(output_dir, "frame_%04d.jpg")
+    cmd = [
+        'ffmpeg', '-i', video_path,
+        '-vf', f'fps=1/{interval}',
+        '-q:v', '2',  # High quality
+        output_pattern
+    ]
+    
+    print(f"Extracting frames: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"Error extracting frames: {result.stderr}")
+        return []
+        
+    return sorted(glob.glob(os.path.join(output_dir, "*.jpg")))
+
+def analyze_frames_with_vision(frame_paths, client):
+    """Send frames to OpenAI Vision for text extraction"""
+    if not frame_paths:
+        return ""
+
+    print(f"Analyzing {len(frame_paths)} frames with OpenAI Vision...")
+    
+    # Process in batches to avoid payload limits
+    batch_size = 5
+    full_text = []
+    
+    for i in range(0, len(frame_paths), batch_size):
+        batch = frame_paths[i:i+batch_size]
+        print(f"Processing batch {i//batch_size + 1}...")
+        
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "These are frames from a video. Extract all visible text from these frames. Ignore standard UI elements (like time, battery, app icons). Output the text sequentially as it appears. If text is repeated across frames, deduplicate it naturally. Return ONLY the text."}
+                ]
+            }
+        ]
+        
+        for frame_path in batch:
+            base64_image = encode_image(frame_path)
+            messages[0]["content"].append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{base64_image}",
+                    "detail": "low" # Use low detail for text, usually sufficient and faster/cheaper
+                }
+            })
+            
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini", # Capable of vision
+                messages=messages,
+                max_tokens=1000
+            )
+            content = response.choices[0].message.content
+            if content:
+                full_text.append(content)
+        except Exception as e:
+            print(f"Vision API error: {e}")
+            
+    return "\n\n".join(full_text)
 
 def split_audio_ffmpeg(audio_file: str, max_size: int = 20*1024*1024) -> List[str]:
     """Split audio file into chunks smaller than max_size bytes"""
@@ -264,7 +344,151 @@ def transcribe_video(req: VideoRequest):
                 else:
                     raise HTTPException(status_code=500, detail="Failed to transcribe any audio chunks")
 
-            raise HTTPException(status_code=500, detail="Failed to get transcript from video.")
+            # Fallback 4: Visual + Metadata Extraction
+            print("Audio extraction failed. Attempting Visual + Metadata extraction...")
+            try:
+                # 0. Try Instaloader for Carousels (Multi-page posts)
+                if "instagram.com" in url:
+                    print("Checking for Instagram Carousel (Sidecar)...")
+                    try:
+                        import instaloader
+                        L = instaloader.Instaloader()
+                        # Extract shortcode
+                        if "/p/" in url:
+                            shortcode = url.split("/p/")[1].split("/")[0]
+                        elif "/reel/" in url:
+                            shortcode = url.split("/reel/")[1].split("/")[0]
+                        else:
+                            shortcode = None
+
+                        if shortcode:
+                            post = instaloader.Post.from_shortcode(L.context, shortcode)
+                            print(f"Instaloader Post Type: {post.typename}")
+                            
+                            if post.typename == 'GraphSidecar':
+                                print("Detected Instagram Sidecar (Carousel). Processing all slides...")
+                                carousel_text = []
+                                slide_count = 0
+                                
+                                for node in post.get_sidecar_nodes():
+                                    slide_count += 1
+                                    image_url = node.display_url
+                                    if not image_url:
+                                        continue
+                                        
+                                    print(f"Processing Slide {slide_count}: {image_url[:50]}...")
+                                    
+                                    # Download image to temp file
+                                    try:
+                                        import requests
+                                        img_resp = requests.get(image_url)
+                                        if img_resp.status_code == 200:
+                                            slide_path = os.path.join(temp_dir, f"slide_{slide_count}.jpg")
+                                            with open(slide_path, "wb") as f:
+                                                f.write(img_resp.content)
+                                            
+                                            # Send to Vision
+                                            slide_text = analyze_frames_with_vision([slide_path], client)
+                                            if slide_text:
+                                                carousel_text.append(f"Slide {slide_count}: {slide_text}")
+                                    except Exception as img_err:
+                                        print(f"Failed to process slide {slide_count}: {img_err}")
+
+                                if carousel_text:
+                                    full_carousel_transcript = "\n\n".join(carousel_text)
+                                    # Add caption
+                                    if post.caption:
+                                        full_carousel_transcript = f"Caption: {post.caption}\n\n" + full_carousel_transcript
+                                        
+                                    return {
+                                        "method": "instagram_carousel",
+                                        "transcript": full_carousel_transcript,
+                                        "title": f"Post by {post.owner_username}"
+                                    }
+                    except Exception as instaloader_err:
+                        print(f"Instaloader check failed: {instaloader_err}")
+                        # Continue to standard yt-dlp fallback
+
+                # Download video AND metadata
+                # Remove --skip-download to get the video file for vision processing
+                dl_cmd = [
+                    "yt-dlp", 
+                    "--write-info-json", 
+                    "--no-warnings",
+                    "-o", f"{temp_dir}/%(title)s.%(ext)s",
+                    url
+                ]
+                print(f"Downloading video for vision analysis: {' '.join(dl_cmd)}")
+                dl_result = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=120, cwd=temp_dir)
+                
+                # 1. Extract Metadata
+                metadata_text = ""
+                title = "Video"
+                info_files = glob.glob(f"{temp_dir}/*.info.json")
+                if info_files:
+                    try:
+                        import json
+                        with open(info_files[0], 'r', encoding='utf-8') as f:
+                            metadata = json.load(f)
+                        
+                        # Get title
+                        title = metadata.get("title") or title
+                        
+                        # Get caption/description
+                        if metadata.get("description"):
+                            metadata_text = metadata["description"]
+                        elif metadata.get("caption"):
+                            metadata_text = metadata["caption"]
+                        elif metadata.get("title") and metadata["title"] != "Video":
+                            metadata_text = metadata["title"]
+                            
+                        print(f"Found metadata text: {len(metadata_text)} chars")
+                    except Exception as e:
+                        print(f"Error parsing metadata: {e}")
+
+                # 2. Extract Visual Text (Vision)
+                visual_text = ""
+                video_files = glob.glob(f"{temp_dir}/*.mp4") # Instagram usually mp4
+                if not video_files:
+                     # Try other extensions
+                     video_files = glob.glob(f"{temp_dir}/*.webm") + glob.glob(f"{temp_dir}/*.mkv")
+
+                if video_files:
+                    video_path = video_files[0]
+                    print(f"Processing video for vision: {video_path}")
+                    
+                    # Extract frames (every 2 seconds)
+                    frames_dir = os.path.join(temp_dir, "frames")
+                    os.makedirs(frames_dir, exist_ok=True)
+                    frame_paths = extract_frames(video_path, frames_dir, interval=2.0)
+                    
+                    if frame_paths:
+                        # Analyze with OpenAI Vision
+                        visual_text = analyze_frames_with_vision(frame_paths, client)
+                        print(f"Extracted visual text: {len(visual_text)} chars")
+                else:
+                    print("No video file found for vision analysis.")
+
+                # 3. Combine Results
+                combined_transcript = ""
+                if metadata_text:
+                    combined_transcript += f"Caption: {metadata_text}\n\n"
+                if visual_text:
+                    combined_transcript += f"Visual Content:\n{visual_text}"
+                
+                if combined_transcript.strip():
+                    return {
+                        "method": "visual_and_metadata", 
+                        "transcript": combined_transcript.strip(), 
+                        "title": title
+                    }
+
+            except Exception as e:
+                print(f"Visual/Metadata fallback failed: {e}")
+                import traceback
+                print(traceback.format_exc())
+
+            raise HTTPException(status_code=500, detail="Failed to get transcript from video (No audio, subtitles, or visual content found).")
     except Exception as e:
         print(f"Error in transcribe_video: {str(e)}")
         import traceback
