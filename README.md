@@ -15,7 +15,9 @@ A FastAPI worker service for video transcription using yt-dlp and OpenAI Whisper
 - pip (Python package manager)
 - ffmpeg (for audio/video processing)
 - yt-dlp (for video downloading)
-- OpenAI API key (for Whisper transcription)
+- instaloader (for Instagram carousel extraction)
+- requests (for image downloading)
+- OpenAI API key (for Whisper transcription and Vision API)
 - ngrok account (free or paid)
 
 ---
